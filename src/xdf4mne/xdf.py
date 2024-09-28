@@ -1,7 +1,8 @@
 from pyxdf import load_xdf, match_streaminfos, resolve_streams
-from ...utils import verbose, logger, warn
-from ...io import RawArray
-from ... import create_info
+from mne.utils import verbose, logger, warn
+from mne.io import RawArray
+from mne import create_info
+
 
 
 def read_raw_xdf(fname,
