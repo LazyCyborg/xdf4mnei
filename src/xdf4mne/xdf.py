@@ -1,9 +1,8 @@
-from pyxdf import load_xdf, match_streaminfos, resolve_streams
+from pyxdf import load_xdf
 from mne.utils import verbose, logger, warn
 from mne.io import RawArray
-from mne import create_info
-
-
+from mne import create_info, Annotations
+import numpy as np
 
 def read_raw_xdf(fname,
                  name_stream_eeg: str = None,
@@ -12,99 +11,91 @@ def read_raw_xdf(fname,
                  data_type_markers: str = 'Markers',
                  *args, **kwargs):
     """Read XDF file.
-    Either specify the name or the stream id
+    Either specify the name or the stream id.
 
+    Note that it does not recognize different data types in the same stream (e.g., EEG + MISC).
 
-    Note that it does not recognize different data types in the same stream  (e.g.: eeg + misc)
     Parameters
     ----------
     fname : str
         Name of the XDF file.
-    name_stream_eeg : int
-        name of the data stream to load (optional).
-    name_stream_markers : int
-        name of a specific marker stream to load (optional), otherwise inserts all marker streams.
+    name_stream_eeg : str
+        Name of the data stream to load (optional).
+    name_stream_markers : str
+        Name of a specific marker stream to load (optional), otherwise inserts all marker streams.
     data_type : str
-        type of the data stream to load (default: 'EEG')
+        Type of the data stream to load (default: 'EEG').
     data_type_markers : str
-        type of the marker stream to load (default: 'Markers')
+        Type of the marker stream to load (default: 'Markers').
 
     Returns
     -------
     raw : mne.io.Raw
-        fromn XDF file data.
+        Raw object from XDF file data.
     """
 
-    # load the xdf file
+    # Load the XDF file
     streams, header = load_xdf(fname)
 
-
-    # Build up a query with data type and name for data stream
-    if name_stream_eeg is not None:
-        eeg_stream_query = [{'name': name_stream_eeg}]
-    else:
-        eeg_stream_query = [{'type': data_type}]
-
-    # Search for a specific eeg stream
-    eeg_stream_found = False
-
+    # Search for the EEG stream
+    eeg_stream = None
     for stream in streams:
-        eeg_streams = match_streaminfos(resolve_streams(fname), eeg_stream_query)
-        if stream["info"]["stream_id"] in eeg_streams:
-            eeg_stream_found = True
-            break  # only selects the first matching stream
+        info = stream['info']
+        if name_stream_eeg:
+            if info['name'][0] == name_stream_eeg:
+                eeg_stream = stream
+                break
+        else:
+            if info['type'][0] == data_type:
+                eeg_stream = stream
+                break
 
-    assert eeg_stream_found, 'No EEG stream found'
-
+    if eeg_stream is None:
+        raise ValueError('No EEG stream found')
 
     # Load EEG data information to compose the info
-    n_chans = int(stream["info"]["channel_count"][0])
-    fs = float(stream["info"]["nominal_srate"][0])
-    labels, types, units = [], [], []
+    n_chans = int(eeg_stream["info"]["channel_count"][0])
+    fs = float(eeg_stream["info"]["nominal_srate"][0])
+    labels = []
     try:
-        for ch in stream["info"]["desc"][0]["channels"][0]["channel"]:
+        for ch in eeg_stream["info"]["desc"][0]["channels"][0]["channel"]:
             labels.append(str(ch["label"][0]))
-            if ch["type"]:
-                types.append(ch["type"][0])
-            if ch["unit"]:
-                units.append(ch["unit"][0])
-    except (TypeError, IndexError):  # no channel labels found
+    except (TypeError, IndexError, KeyError):  # No channel labels found
         pass
     if not labels:
-        labels = [str(n) for n in range(n_chans)]
-    if not units:
-        units = ["NA" for _ in range(n_chans)]
+        labels = [f'EEG {n}' for n in range(n_chans)]
 
-    info = create_info(ch_names=labels, sfreq=fs, ch_types=data_type.lower())  # check types as a list
-    # Create the info
-    raw = RawArray((stream["time_series"]).T, info)
-    # define manually the _filenames which may cause errors otherwise
+    info = create_info(ch_names=labels, sfreq=fs, ch_types=['eeg'] * n_chans)
+    data = np.array(eeg_stream["time_series"]).T
+    # Create the Raw object
+    raw = RawArray(data, info)
+    # Manually define the _filenames attribute
     raw._filenames = [fname]
 
-    # keep the first sample timestamp to align markers
-    first_samp = stream["time_stamps"][0]
+    # Keep the first sample timestamp to align markers
+    first_samp = eeg_stream["time_stamps"][0]
 
+    # Find the marker streams
+    markers_streams = []
+    for stream in streams:
+        info = stream['info']
+        if name_stream_markers:
+            if info['name'][0] == name_stream_markers:
+                markers_streams.append(stream)
+                break
+        else:
+            if info['type'][0] == data_type_markers:
+                markers_streams.append(stream)
 
-    # Find the markers streams
+    # Iterate over marker streams
+    for marker_stream in markers_streams:
+        # Realign the first timestamp to the data
+        onsets = marker_stream["time_stamps"] - first_samp
+        # Extract description labels
+        descriptions = [item[0] if isinstance(item, list) else item for item in marker_stream["time_series"]]
+        # Add to the raw as annotations
+        durations = [0] * len(onsets)
+        annotations = Annotations(onset=onsets, duration=durations, description=descriptions)
+        raw.set_annotations(raw.annotations + annotations)
 
-    # Define the query
-    if name_stream_markers is not None:
-        marker_stream_query = [{'name': name_stream_markers}]  # optional name for markers
-    else:
-        marker_stream_query = [{'type': data_type_markers}]
-
-    markers = match_streaminfos(resolve_streams(fname), marker_stream_query)
-
-    # Iterate over marker stream ids
-    for stream_id in markers:
-        for stream in streams:
-
-            # if stream_id matches, add the markers as annotations
-            if stream["info"]["stream_id"] == stream_id:
-                # realigns the first time stamp to the data
-                onsets = stream["time_stamps"] - first_samp  # **** IMPORTANT ***
-                # extract description labels
-                descriptions = [item for sub in stream["time_series"] for item in sub]
-                # add to the raw as annoations
-                raw.annotations.append(onsets, [0] * len(onsets), descriptions)
     return raw
